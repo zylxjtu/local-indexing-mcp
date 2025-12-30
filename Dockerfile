@@ -1,5 +1,8 @@
 FROM python:3.11-slim
 
+# Accept port as build argument with default value
+ARG FASTMCP_PORT=8978
+
 WORKDIR /app
 
 # Install system dependencies
@@ -20,8 +23,8 @@ COPY code_indexer_server.py .
 # Create directory for ChromaDB
 RUN mkdir -p /app/chroma_db
 
-# Expose the port the app runs on
-EXPOSE 8000
+# Expose the FastMCP port (uses ARG from build-time)
+EXPOSE ${FASTMCP_PORT}
 
 # Command to run the application
 CMD ["python", "code_indexer_server.py"] 

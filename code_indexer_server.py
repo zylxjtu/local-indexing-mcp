@@ -86,7 +86,7 @@ DEFAULT_FILE_EXTENSIONS = {
 config = None
 chroma_client = None
 embedding_function = None
-mcp = FastMCP(title="Code Indexer Server")
+mcp = FastMCP("Code Indexer Server")
 observers = []
 
 
@@ -179,9 +179,78 @@ class CodeIndexerEventHandler(FileSystemEventHandler):
             logger.error(f"Error removing chunks for {file_path}: {e}")
 
 
+def auto_discover_folders(projects_root: str, ignore_dirs: Set[str]) -> List[str]:
+    """
+    Auto-discover all first-level subdirectories in projects_root.
+
+    Args:
+        projects_root: Root directory to scan
+        ignore_dirs: Set of directory names to ignore
+
+    Returns:
+        List of relative folder paths to index
+    """
+    discovered_folders = []
+
+    try:
+        if not os.path.exists(projects_root):
+            logger.warning(f"Projects root does not exist: {projects_root}")
+            return []
+
+        # List all items in projects_root
+        for item in os.listdir(projects_root):
+            item_path = os.path.join(projects_root, item)
+
+            # Skip if not a directory
+            if not os.path.isdir(item_path):
+                continue
+
+            # Skip if it's a symlink
+            if os.path.islink(item_path):
+                logger.info(f"Skipping symlink: {item}")
+                continue
+
+            # Skip if in ignore list or starts with dot
+            if item in ignore_dirs or item.startswith('.'):
+                logger.info(f"Skipping ignored directory: {item}")
+                continue
+
+            discovered_folders.append(item)
+
+        logger.info(f"Auto-discovered {len(discovered_folders)} folders: {discovered_folders}")
+        return discovered_folders
+
+    except Exception as e:
+        logger.error(f"Error during auto-discovery: {e}")
+        return []
+
+
 def get_config_from_env():
-    """Get configuration from environment variables."""
+    """
+    Get configuration from environment variables.
+
+    Supports two modes:
+    1. Manual mode: Set FOLDERS_TO_INDEX with specific folders (comma-separated)
+    2. Auto mode (default): When FOLDERS_TO_INDEX is empty, automatically discovers
+       all first-level subdirectories in PROJECTS_ROOT
+    """
+    # Validate FASTMCP_PORT is set
+    fastmcp_port = os.getenv("FASTMCP_PORT")
+    if not fastmcp_port:
+        logger.error("FASTMCP_PORT environment variable is not set")
+        raise ValueError("FASTMCP_PORT environment variable is required")
+
+    try:
+        port_value = int(fastmcp_port)
+        if not (1 <= port_value <= 65535):
+            raise ValueError(f"Port must be between 1 and 65535, got {port_value}")
+    except ValueError as e:
+        logger.error(f"Invalid FASTMCP_PORT value: {fastmcp_port}")
+        raise ValueError(f"FASTMCP_PORT must be a valid port number: {e}")
+
     projects_root = os.getenv("PROJECTS_ROOT", "/projects")
+
+    # Get manual folder configuration
     folders_to_index = os.getenv("FOLDERS_TO_INDEX", "").split(",")
     folders_to_index = [f.strip() for f in folders_to_index if f.strip()]
 
@@ -204,9 +273,17 @@ def get_config_from_env():
     ignore_dirs = list(DEFAULT_IGNORE_DIRS | set(additional_ignore_dirs))
     ignore_files = list(DEFAULT_IGNORE_FILES | set(additional_ignore_files))
 
-    if not folders_to_index:
-        logger.warning("No folders specified to index. Using root directory.")
-        folders_to_index = [""]
+    # Determine which folders to index
+    if folders_to_index:
+        # Manual configuration provided
+        logger.info(f"Using manually configured folders: {folders_to_index}")
+    else:
+        # Auto-discover folders (default behavior)
+        logger.info("FOLDERS_TO_INDEX is empty, auto-discovering folders...")
+        folders_to_index = auto_discover_folders(projects_root, set(ignore_dirs))
+        if not folders_to_index:
+            logger.warning("No folders discovered. Using root directory.")
+            folders_to_index = [""]
 
     return {
         "projects_root": projects_root,
@@ -236,7 +313,7 @@ async def initialize_chromadb():
         # Initialize embedding function
         embedding_function = (
             embedding_functions.SentenceTransformerEmbeddingFunction(
-                model_name="all-MiniLM-L6-v2"
+                model_name="all-MiniLM-L6-v2"  # Faster model for quicker indexing
             )
         )
         logger.info("Embedding function initialized")
@@ -259,7 +336,7 @@ async def initialize_chromadb():
             try:
                 embedding_function = (
                     embedding_functions.SentenceTransformerEmbeddingFunction(
-                        model_name="all-MiniLM-L6-v2"
+                        model_name="all-MiniLM-L6-v2"  # Faster model for quicker indexing
                     )
                 )
             except Exception as embed_err:
@@ -667,14 +744,16 @@ async def search_code(
             })
 
         # Get all collections
-        collection_names = chroma_client.list_collections()
+        collections = chroma_client.list_collections()
 
         # Find matching collections
         matching_collections = []
         project_name = project.lower()
-        for collection_name in collection_names:
+        for collection in collections:
             # The collection name might be in format "customerX_project1" or just "project1"
             # We want to match if project_name fully matches the part after the last _ (if any)
+            # Handle both old API (strings) and new API (Collection objects)
+            collection_name = collection.name if hasattr(collection, 'name') else str(collection)
             collection_parts = collection_name.lower().split('_')
             if collection_parts[-1] == project_name:
                 matching_collections.append(collection_name)
@@ -747,7 +826,7 @@ async def main():
         asyncio.create_task(index_projects())
         logger.info("File watching task started")
 
-    await mcp.run_sse_async()
+    await mcp.run_async(transport="sse")
 
 if __name__ == "__main__":
     asyncio.run(main())
