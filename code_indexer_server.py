@@ -3,7 +3,9 @@
 import os
 import logging
 import json
-from typing import List, Set
+import time
+from threading import Lock
+from typing import List, Set, Dict, Tuple, Optional
 import chromadb
 from chromadb.config import Settings
 from chromadb.utils import embedding_functions
@@ -88,6 +90,175 @@ chroma_client = None
 embedding_function = None
 mcp = FastMCP("Code Indexer Server")
 observers = []
+debounced_handler: Optional["DebouncedFileHandler"] = None
+
+
+class DebouncedFileHandler:
+    """
+    Handles file changes with debouncing and deduplication.
+
+    - Collects file changes for a configurable debounce period
+    - Deduplicates changes (same file changed multiple times = one operation)
+    - Processes changes in batches for efficiency
+    - Prevents concurrent processing with a lock
+    """
+
+    def __init__(self, debounce_seconds: float = 5.0):
+        self.pending_changes: Dict[str, Tuple[str, str, float]] = {}  # {filepath: (action, folder_name, timestamp)}
+        self.lock = Lock()
+        self.debounce_seconds = debounce_seconds
+        self.processing_lock = asyncio.Lock()
+        self.last_change_time: float = 0
+        self._debounce_task: Optional[asyncio.Task] = None
+        self._worker_task: Optional[asyncio.Task] = None
+        self._running = False
+
+    def start(self):
+        """Start the background worker."""
+        self._running = True
+        logger.info(f"DebouncedFileHandler started with {self.debounce_seconds}s debounce")
+
+    def stop(self):
+        """Stop the background worker."""
+        self._running = False
+        if self._debounce_task and not self._debounce_task.done():
+            self._debounce_task.cancel()
+        logger.info("DebouncedFileHandler stopped")
+
+    def add_change(self, file_path: str, action: str, folder_name: str):
+        """
+        Add a file change to the pending queue.
+        Automatically deduplicates - latest change for each file wins.
+        """
+        with self.lock:
+            self.pending_changes[file_path] = (action, folder_name, time.time())
+            self.last_change_time = time.time()
+            pending_count = len(self.pending_changes)
+
+        logger.debug(f"Queued {action} for {file_path} ({pending_count} pending)")
+
+        # Schedule debounce processing
+        self._schedule_debounce()
+
+    def _schedule_debounce(self):
+        """Schedule the debounce timer to process changes."""
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                # Cancel existing debounce task if any
+                if self._debounce_task and not self._debounce_task.done():
+                    self._debounce_task.cancel()
+                # Schedule new debounce task
+                self._debounce_task = loop.create_task(self._debounce_wait())
+        except RuntimeError:
+            # No event loop running yet, will be processed when loop starts
+            pass
+
+    async def _debounce_wait(self):
+        """Wait for debounce period then trigger processing."""
+        try:
+            await asyncio.sleep(self.debounce_seconds)
+
+            # Check if more changes came in during the wait
+            with self.lock:
+                time_since_last = time.time() - self.last_change_time
+
+            if time_since_last >= self.debounce_seconds:
+                # No new changes, process the batch
+                await self._process_batch()
+            else:
+                # More changes came in, reschedule
+                self._schedule_debounce()
+        except asyncio.CancelledError:
+            pass  # Task was cancelled, new one will be scheduled
+
+    def get_and_clear_changes(self) -> Dict[str, Tuple[str, str, float]]:
+        """Atomically get all pending changes and clear the buffer."""
+        with self.lock:
+            changes = self.pending_changes.copy()
+            self.pending_changes.clear()
+            return changes
+
+    async def _process_batch(self):
+        """Process all pending changes in a batch."""
+        if not self._running:
+            return
+
+        async with self.processing_lock:
+            changes = self.get_and_clear_changes()
+
+            if not changes:
+                return
+
+            logger.info(f"Processing batch of {len(changes)} file changes")
+
+            # Group changes by action type for logging
+            modifications = []
+            deletions = []
+
+            for file_path, (action, folder_name, _) in changes.items():
+                if action == "deleted":
+                    deletions.append((file_path, folder_name))
+                else:
+                    modifications.append((file_path, folder_name))
+
+            # Process deletions first
+            for file_path, folder_name in deletions:
+                try:
+                    await self._handle_deletion(file_path, folder_name)
+                except Exception as e:
+                    logger.error(f"Error processing deletion for {file_path}: {e}")
+
+            # Process modifications/creations
+            for file_path, folder_name in modifications:
+                try:
+                    await self._handle_modification(file_path, folder_name)
+                except Exception as e:
+                    logger.error(f"Error processing modification for {file_path}: {e}")
+
+            logger.info(f"Batch processing complete: {len(modifications)} modified, {len(deletions)} deleted")
+
+    async def _handle_modification(self, file_path: str, folder_name: str):
+        """Handle a file modification or creation."""
+        try:
+            # Check if file still exists (might have been deleted after the change was queued)
+            if not os.path.exists(file_path):
+                logger.debug(f"File no longer exists, skipping: {file_path}")
+                return
+
+            collection_name = sanitize_collection_name(folder_name)
+            rel_path = os.path.relpath(file_path, config["projects_root"])
+
+            # Load and process the single file
+            reader = SimpleDirectoryReader(input_files=[file_path])
+            documents = reader.load_data()
+
+            if documents:
+                documents[0].metadata["file_path"] = rel_path
+                process_and_index_documents(
+                    documents,
+                    collection_name,
+                    "chroma_db"
+                )
+                logger.info(f"Indexed: {rel_path}")
+        except Exception as e:
+            logger.error(f"Error indexing {file_path}: {e}")
+
+    async def _handle_deletion(self, file_path: str, folder_name: str):
+        """Handle a file deletion."""
+        try:
+            collection_name = sanitize_collection_name(folder_name)
+            rel_path = os.path.relpath(file_path, config["projects_root"])
+
+            collection = chroma_client.get_collection(
+                name=collection_name,
+                embedding_function=embedding_function
+            )
+
+            collection.delete(where={"file_path": rel_path})
+            logger.info(f"Removed from index: {rel_path}")
+        except Exception as e:
+            logger.error(f"Error removing {file_path} from index: {e}")
 
 
 def sanitize_collection_name(folder_name: str) -> str:
@@ -96,6 +267,13 @@ def sanitize_collection_name(folder_name: str) -> str:
 
 
 class CodeIndexerEventHandler(FileSystemEventHandler):
+    """
+    File system event handler that delegates to the debounced handler.
+
+    Instead of processing files immediately, it queues changes to be
+    processed in batches after a debounce period.
+    """
+
     def __init__(self, folder_name: str):
         self.folder_name = folder_name
         self.collection_name = sanitize_collection_name(folder_name)
@@ -112,7 +290,7 @@ class CodeIndexerEventHandler(FileSystemEventHandler):
             self.file_extensions,
             self.ignore_files
         ):
-            self._handle_file_change(event.src_path)
+            self._queue_change(event.src_path, "created")
 
     def on_modified(self, event):
         if event.is_directory:
@@ -123,7 +301,7 @@ class CodeIndexerEventHandler(FileSystemEventHandler):
             self.file_extensions,
             self.ignore_files
         ):
-            self._handle_file_change(event.src_path)
+            self._queue_change(event.src_path, "modified")
 
     def on_deleted(self, event):
         if event.is_directory:
@@ -134,49 +312,15 @@ class CodeIndexerEventHandler(FileSystemEventHandler):
             self.file_extensions,
             self.ignore_files
         ):
-            self._handle_file_deletion(event.src_path)
+            self._queue_change(event.src_path, "deleted")
 
-    def _handle_file_change(self, file_path: str):
-        try:
-            # Calculate relative path
-            rel_path = os.path.relpath(file_path, config["projects_root"])
-
-            # Load and process the single file
-            reader = SimpleDirectoryReader(input_files=[file_path])
-            documents = reader.load_data()
-
-            if documents:
-                # Update metadata with relative path
-                documents[0].metadata["file_path"] = rel_path
-
-                # Process and index the document
-                process_and_index_documents(
-                    documents,
-                    self.collection_name,
-                    "chroma_db"
-                )
-                logger.info(f"Indexed updated file: {rel_path}")
-        except Exception as e:
-            logger.error(f"Error processing file {file_path}: {e}")
-
-    def _handle_file_deletion(self, file_path: str):
-        try:
-            # Calculate relative path
-            rel_path = os.path.relpath(file_path, config["projects_root"])
-
-            # Get the collection
-            collection = chroma_client.get_collection(
-                name=self.collection_name,
-                embedding_function=embedding_function
-            )
-
-            # Delete all chunks from this file
-            collection.delete(
-                where={"file_path": rel_path}
-            )
-            logger.info(f"Removed indexed chunks for deleted file: {rel_path}")
-        except Exception as e:
-            logger.error(f"Error removing chunks for {file_path}: {e}")
+    def _queue_change(self, file_path: str, action: str):
+        """Queue a file change for debounced processing."""
+        global debounced_handler
+        if debounced_handler:
+            debounced_handler.add_change(file_path, action, self.folder_name)
+        else:
+            logger.warning(f"Debounced handler not initialized, skipping {action} for {file_path}")
 
 
 def auto_discover_folders(projects_root: str, ignore_dirs: Set[str]) -> List[str]:
@@ -269,6 +413,20 @@ def get_config_from_env():
         f.strip() for f in additional_ignore_files if f.strip()
     ]
 
+    # Get debounce configuration (seconds to wait before processing file changes)
+    debounce_seconds_str = os.getenv("DEBOUNCE_SECONDS", "5.0")
+    try:
+        debounce_seconds = float(debounce_seconds_str)
+        if debounce_seconds < 0.5:
+            logger.warning(f"DEBOUNCE_SECONDS too low ({debounce_seconds}), using minimum 0.5")
+            debounce_seconds = 0.5
+        elif debounce_seconds > 60:
+            logger.warning(f"DEBOUNCE_SECONDS too high ({debounce_seconds}), using maximum 60")
+            debounce_seconds = 60
+    except ValueError:
+        logger.warning(f"Invalid DEBOUNCE_SECONDS value '{debounce_seconds_str}', using default 5.0")
+        debounce_seconds = 5.0
+
     # Combine default and additional ignore patterns
     ignore_dirs = list(DEFAULT_IGNORE_DIRS | set(additional_ignore_dirs))
     ignore_files = list(DEFAULT_IGNORE_FILES | set(additional_ignore_files))
@@ -290,7 +448,8 @@ def get_config_from_env():
         "folders_to_index": folders_to_index,
         "ignore_dirs": ignore_dirs,
         "ignore_files": ignore_files,
-        "file_extensions": list(DEFAULT_FILE_EXTENSIONS)
+        "file_extensions": list(DEFAULT_FILE_EXTENSIONS),
+        "debounce_seconds": debounce_seconds
     }
 
 
@@ -818,10 +977,18 @@ async def search_code(
 
 # Run initialization before starting MCP
 async def main():
+    global debounced_handler
+
     # Initialize ChromaDB before starting MCP
     success = await initialize_chromadb()
 
     if success:
+        # Initialize the debounced file handler
+        debounce_seconds = config.get("debounce_seconds", 5.0)
+        debounced_handler = DebouncedFileHandler(debounce_seconds=debounce_seconds)
+        debounced_handler.start()
+        logger.info(f"Debounced file handler initialized ({debounce_seconds}s debounce)")
+
         # Start file watching in background
         asyncio.create_task(index_projects())
         logger.info("File watching task started")

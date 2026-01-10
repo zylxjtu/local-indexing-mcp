@@ -57,6 +57,7 @@ PROJECTS_ROOT=~/git                        # Root directory containing projects
 FOLDERS_TO_INDEX=                          # Comma-separated list (empty = auto-discover)
 ADDITIONAL_IGNORE_DIRS=vendor,third_party  # Directories to exclude
 ADDITIONAL_IGNORE_FILES=*.pb.go,*.min.js   # File patterns to exclude
+DEBOUNCE_SECONDS=10.0                      # Debounce time for file change batching
 ```
 
 ### Default Exclusions
@@ -113,6 +114,15 @@ docker compose up -d
 ### Rule 5: Don't Follow Symlinks
 **Security**: All file operations use `followlinks=False` to prevent directory traversal attacks
 **Code**: See `load_documents()` function line 397 and 408
+
+### Rule 6: Debouncing for Large Git Operations
+**Why**: Git checkout/pull on large repos (e.g., Kubernetes) can trigger thousands of file change events
+**Solution**: File changes are batched and deduplicated using the `DebouncedFileHandler` class
+**Configuration**: Set `DEBOUNCE_SECONDS` in `.env` (default: 10.0 seconds)
+**Behavior**:
+- File changes are collected for the debounce period
+- Same file changed multiple times = only processed once (latest state)
+- Prevents overwhelming the indexer during git operations
 
 ## Docker Commands
 
@@ -370,5 +380,7 @@ Before asking for help, verify:
 - **v1.2**: Switched to Jina embeddings model
 - **v1.3**: Added vendor directory exclusions
 - **v1.4**: Fixed environment variable passing in Docker
+- **v1.5**: Fixed ChromaDB 1.4.0 `list_collections()` API compatibility
+- **v1.6**: Added debounced file handler for batching and deduplication of file changes
 
-Last updated: 2026-01-02
+Last updated: 2026-01-10

@@ -17,5 +17,6 @@ services:
       FOLDERS_TO_INDEX: ${FOLDERS_TO_INDEX}  # Use env variable for folders
       ADDITIONAL_IGNORE_DIRS: ${ADDITIONAL_IGNORE_DIRS}  # Additional directories to ignore
       ADDITIONAL_IGNORE_FILES: ${ADDITIONAL_IGNORE_FILES}  # Additional files to ignore
+      DEBOUNCE_SECONDS: ${DEBOUNCE_SECONDS:-10.0}  # Debounce time for file change processing
     restart: unless-stopped
     container_name: code-indexer-mcp 

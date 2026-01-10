@@ -88,11 +88,68 @@ If you want to use this indexing server with Claude Code CLI instead of Cursor I
 
 Claude Code will now be able to search your codebase using the semantic search capabilities provided by the indexing server.
 
+## MCP Tools
+
+The server exposes the following tool via MCP:
+
+### `search_code`
+
+Search code using natural language queries with semantic similarity.
+
+**Parameters:**
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `query` | string | (required) | Natural language query about the codebase |
+| `project` | string | (required) | Collection/folder name to search in (use the current workspace name) |
+| `n_results` | int | 5 | Number of results to return |
+| `threshold` | float | 30.0 | Minimum relevance percentage to include results (0-100) |
+
+**Example usage in AI assistant:**
+```
+Search for "authentication middleware" in project "my-app" with 10 results
+```
+
+**Returns:** JSON with matching code snippets, including:
+- `text`: The matching code snippet
+- `file_path`: Relative path to the file
+- `start_line` / `end_line`: Line numbers in the file
+- `language`: Detected programming language
+- `relevance`: Similarity score (percentage)
+
 ## How It Works
 
 This project creates a vector database of your code using ChromaDB and exposes a semantic search tool via the MCP protocol. The `search_code` tool allows querying your codebase using natural language.
 
 When integrated with either Cursor IDE or Claude Code CLI, the AI assistant gains the ability to search through your codebase semantically, finding relevant code snippets that match the intent of your queries rather than just matching keywords.
+
+## Data Storage
+
+### ChromaDB Location
+
+The vector database is stored persistently on your host machine:
+
+| Location | Path |
+|----------|------|
+| Host | `./chroma_db/` (relative to project root) |
+| Container | `/app/chroma_db` |
+
+The database persists across container restarts. To force a complete re-index, delete the `chroma_db/` directory:
+
+```bash
+docker compose down
+rm -rf chroma_db/
+docker compose up -d
+```
+
+### Model Cache
+
+Embedding models are cached to avoid re-downloading:
+
+| Location | Path |
+|----------|------|
+| Host | `./container_cache/` |
+| Container | `/root/.cache` |
 
 ## Troubleshooting
 
